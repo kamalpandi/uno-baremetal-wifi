@@ -1,0 +1,23 @@
+# .clangd — editor hints for this bare-metal AVR project.
+#
+# clangd never reads the Makefile, so on its own it analyses these files as
+# host x86 C: it cannot find <avr/io.h> and red-squiggles every register.
+#
+# Two pieces fix that:
+#   1. `make compdb` writes compile_commands.json with the exact avr-gcc
+#      command line per file (see the Makefile).
+#   2. The settings below supply the AVR-specific bits clangd cannot infer
+#      from that command line.
+CompileFlags:
+  # Present the command as avr-gcc so clangd's --query-driver
+  # (configured in the Neovim clangd setup) also pulls in the avr-libc
+  # system include paths.
+  Compiler: /usr/bin/avr-gcc
+  Add:
+    - -I/usr/lib/avr/include   # avr/io.h, util/delay.h, avr/pgmspace.h, ...
+    - -D__AVR_ATmega328P__     # pick the atmega328p register definitions
+  # These only exist to drive the build's dependency generation; harmless
+  # but noisy when clangd parses the file.
+  Remove:
+    - -MMD
+    - -MP

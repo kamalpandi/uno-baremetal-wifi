@@ -1,49 +1,60 @@
 /*
- * main.c — Phase 0: prove the toolchain and the upload path.
+ * main.c — Phase 1: get a debug console working on D0/D1.
  *
- * There is deliberately no UART in this file. Before writing a single
- * line of serial code we want to know, with certainty, that:
+ * Success looks like this:
  *
- *   1. avr-gcc can produce a .hex for this chip,
- *   2. avrdude can push that .hex through the CH340 clone's bootloader,
- *   3. the chip actually runs and we can see it.
+ *   1. a banner appears in your serial terminal at 115200 baud,
+ *   2. every character you type comes back reported in hex.
  *
- * The onboard LED on Arduino pin D13 is the cheapest possible "hello".
+ * Point 2 matters more than it looks. A working transmitter is easy to
+ * fake by accident; a working *receiver* proves the baud rate, frame
+ * format and wiring are all genuinely correct in both directions.
+ *
+ * Notice that every fixed message below is wrapped in PSTR() and sent
+ * with the _P variant. These strings therefore cost flash only, and the
+ * whole program uses no RAM beyond what the C runtime needs.
  */
 
 #include <avr/io.h>
-#include <util/delay.h>
+#include <avr/pgmspace.h>
 
-/*
- * _BV(n) is defined by avr-libc as (1 << n).
- *
- * The name means "bit value". Writing _BV(DDB5) is identical to writing
- * (1 << 5) == 0b00100000. It is spelled out separately so the reader knows
- * we mean "bit 5", not "the number 32".
- *
- * DDB5 is the Data Direction bit for port B pin 5, which is Arduino D13.
- *   DDRB  (Data Direction Register B): 1 = output, 0 = input
- *   PORTB (output register): when the pin is an output, 1 = high, 0 = low
- */
-static void led_init(void)
-{
-    DDRB |= _BV(DDB5);   /* configure PB5/D13 as an output */
-}
+#include "uart0.h"
 
 int main(void)
 {
-    led_init();
+    uart0_init();
 
+    uart0_putsln_P(PSTR(""));
+    uart0_putsln_P(PSTR("uno-baremetal-wifi"));
+    uart0_putsln_P(PSTR("Phase 1: USART0 up at 115200 8N1"));
+    uart0_putsln_P(PSTR("Type something and watch it come back as hex."));
+    uart0_putsln_P(PSTR(""));
+
+    /*
+     * The whole loop is non-blocking.
+     *
+     * Nothing here ever waits for input. If there is no byte, we just
+     * go around again. This is the shape every later phase will take:
+     * check what has arrived, do a little work, return immediately.
+     * It is the difference between a program that can also service a
+     * WiFi module and one that cannot.
+     */
     for (;;) {
-        PORTB |= _BV(PORTB5);    /* drive the pin high -> LED on  */
-        _delay_ms(500);
+        if (uart0_has_data()) {
+            char c = uart0_getc();
 
-        PORTB &= ~_BV(PORTB5);   /* drive the pin low  -> LED off */
-        _delay_ms(500);
+            uart0_puts_P(PSTR("received "));
+            uart0_put_hex8((uint8_t)c);
+
+            if (c == '\r' || c == '\n') {
+                uart0_putsln_P(PSTR("   <- line ending"));
+            } else {
+                uart0_puts_P(PSTR("   '"));
+                uart0_putc(c);
+                uart0_putsln_P(PSTR("'"));
+            }
+        }
     }
 
-    /* Unreachable. An embedded program never returns; there is nothing
-     * to return to. If main() ever fell off the end the chip would
-     * re-run the reset vector and start over, which would be a bug. */
-    return 0;
+    return 0; /* unreachable */
 }

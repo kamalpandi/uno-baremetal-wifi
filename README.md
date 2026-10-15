@@ -7,8 +7,8 @@ No Arduino core. No libraries. `avr-gcc` writes directly to registers.
 
 ## Status
 
-**Phase 0** — the toolchain works end to end: `avr-gcc` produces a `.hex`,
-`avrdude` reaches the board's bootloader, and the chip runs.
+**Phase 1** — the debug console works: a register-level USART0 driver on
+D0/D1 at 115200 8N1, verified by echoing typed characters back as hex.
 
 ## Hardware
 
@@ -31,7 +31,7 @@ Arduino ATmega16U2, so it enumerates as `/dev/ttyUSB0` instead of
 ## Roadmap
 
 - [x] **Phase 0 — toolchain.** Blink PB5, prove `avrdude` works on this clone.
-- [ ] **Phase 1 — `uart0.c`.** Register-level USART0 debug console.
+- [x] **Phase 1 — `uart0.c`.** Register-level USART0 debug console.
 - [ ] **Phase 2 — `softuart_tx.c`.** Timer1-driven bit-banged transmit.
 - [ ] **Phase 3 — `softuart_rx.c`.** `INT0` start-bit detect, sampling ISR.
 - [ ] **Phase 4 — `at.c` + `at_parse.c`.** Non-blocking AT command layer.
