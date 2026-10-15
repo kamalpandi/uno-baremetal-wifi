@@ -1,31 +1,35 @@
 /*
- * main.c — Phase 3+4 diagnostics.
- *
- * The point of this build is to find out what is actually arriving on D2.
- * The previous build could only report "TIMEOUT" or a line it happened to
- * recognise, and picocom renders most raw bytes as nothing at all.
+ * main.c — Phase 5: credentials in EEPROM, and joining a network.
  *
  * CONTROLS (type into picocom; it has no local echo)
- *   any other key  send AT once and report the result
- *   h              toggle hex dump of every received byte
- *   s              print the receiver counters
+ *   any other key  send AT
+ *   c              enter WiFi credentials and save them to EEPROM
+ *   u              show the stored credentials
+ *   j              join the network
+ *   n              network status (mode and IP address)
+ *   h              toggle hex dump of received bytes
+ *   s              receiver counters
  *   f              flush the receive queue
- *
- * With the hex dump on, whatever comes back is honest: two hex digits per
- * byte, so 0x00, 0xFF and 0x41 are finally distinguishable.
+ *   t              loopback self-test (needs D2 jumpered to D3)
  */
 
+#include <string.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 
 #include "at.h"
+#include "console.h"
+#include "net.h"
+#include "settings.h"
 #include "softuart.h"
 #include "timer.h"
 #include "uart0.h"
 
 static uint8_t hex_mode;
 
+static void set_credentials(void);
+static void show_credentials(void);
 static void report_stats(void);
 static void loopback_test(void);
 static void run(const char *cmd_p, uint16_t timeout_ms);
@@ -44,22 +48,21 @@ int main(void)
 
     uart0_putsln_P(PSTR(""));
     uart0_putsln_P(PSTR("uno-baremetal-wifi"));
-    uart0_putsln_P(PSTR("Phase 3+4 diagnostics - RX on D2, TX on D3, 9600 8N1"));
+    uart0_putsln_P(PSTR("Phase 5: EEPROM credentials + network join"));
     uart0_putsln_P(PSTR(""));
-    uart0_putsln_P(PSTR("  any key  send AT"));
-    uart0_putsln_P(PSTR("  h        toggle hex dump of received bytes"));
-    uart0_putsln_P(PSTR("  s        show receiver counters"));
-    uart0_putsln_P(PSTR("  f        flush the receive queue"));
-    uart0_putsln_P(PSTR("  t        loopback self-test (needs D2 jumpered to D3)"));
+    uart0_putsln_P(PSTR("  c  set WiFi credentials       j  join network"));
+    uart0_putsln_P(PSTR("  u  show stored credentials    n  network status"));
+    uart0_putsln_P(PSTR("  h  hex dump      s  counters   f  flush   t  loopback"));
+    uart0_putsln_P(PSTR("  any other key  send AT"));
     uart0_putsln_P(PSTR(""));
 
-    /*
-     * One command on boot, so a plain reset still exercises the link.
-     * Everything after that is driven from the terminal.
-     */
-    run(PSTR("AT"), 2000);
-
-    uart0_putsln_P(PSTR("Ready."));
+    if (settings_valid()) {
+        uart0_puts_P(PSTR("Stored network: "));
+        uart0_puts(settings_get()->ssid);
+        uart0_putsln_P(PSTR(""));
+    } else {
+        uart0_putsln_P(PSTR("No WiFi credentials stored yet - press 'c'."));
+    }
     uart0_putsln_P(PSTR(""));
 
     for (;;) {
@@ -73,41 +76,128 @@ int main(void)
     return 0; /* unreachable */
 }
 
+/* ---------------------------------------------------------------------- */
+/* Credential entry                                                        */
+/* ---------------------------------------------------------------------- */
+
+static void set_credentials(void)
+{
+    wifi_creds_t fresh;
+
+    uart0_putsln_P(PSTR(""));
+    uart0_putsln_P(PSTR("=== WiFi credentials ==="));
+    uart0_puts_P(PSTR("SSID (up to 32 chars, Enter now to cancel): "));
+
+    if (console_read_line(fresh.ssid, WIFI_SSID_MAX) == 0) {
+        uart0_putsln_P(PSTR("cancelled, nothing changed."));
+        uart0_putsln_P(PSTR(""));
+        return;
+    }
+
+    uart0_puts_P(PSTR("Password (up to 63 chars): "));
+    console_read_line(fresh.pass, WIFI_PASS_MAX);
+
+    uart0_putsln_P(PSTR(""));
+    uart0_puts_P(PSTR("Writing to EEPROM... "));
+
+    /*
+     * ~3.4 ms per byte that actually changes, so this is a visible
+     * pause on a first save. Interrupts stay enabled throughout, so
+     * only the console stops responding, not the radio.
+     */
+    settings_save(&fresh);
+
+    uart0_putsln_P(PSTR("saved."));
+    uart0_putsln_P(PSTR("Press 'j' to join."));
+    uart0_putsln_P(PSTR(""));
+}
+
+static void show_credentials(void)
+{
+    const wifi_creds_t *creds = settings_get();
+
+    uart0_putsln_P(PSTR(""));
+
+    if (!settings_valid()) {
+        uart0_putsln_P(PSTR("No credentials stored. Press 'c'."));
+        uart0_putsln_P(PSTR(""));
+        return;
+    }
+
+    uart0_puts_P(PSTR("SSID     : "));
+    uart0_puts(creds->ssid);
+    uart0_putsln_P(PSTR(""));
+
+    uart0_puts_P(PSTR("Password : "));
+    uart0_puts(creds->pass);
+    uart0_putsln_P(PSTR(""));
+
+    uart0_puts_P(PSTR("Lengths  : SSID "));
+    uart0_put_udec((uint16_t)strlen(creds->ssid));
+    uart0_puts_P(PSTR(", password "));
+    uart0_put_udec((uint16_t)strlen(creds->pass));
+    uart0_putsln_P(PSTR(""));
+    uart0_putsln_P(PSTR(""));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Key handling                                                            */
+/* ---------------------------------------------------------------------- */
+
 static void handle_key(char c)
 {
-    if (c == 'h') {
+    switch (c) {
+    case 'c':
+        set_credentials();
+        return;
+
+    case 'u':
+        show_credentials();
+        return;
+
+    case 'j':
+        net_join();
+        return;
+
+    case 'n':
+        net_status();
+        return;
+
+    case 'h':
         hex_mode = (uint8_t)(hex_mode ? 0 : 1);
         at_set_hexdump(hex_mode);
-
         uart0_putsln_P(PSTR(""));
         uart0_puts_P(PSTR("[hex dump "));
         uart0_puts_P(hex_mode ? PSTR("ON") : PSTR("OFF"));
         uart0_putsln_P(PSTR("]"));
         uart0_putsln_P(PSTR(""));
         return;
-    }
 
-    if (c == 's') {
+    case 's':
         report_stats();
         return;
-    }
 
-    if (c == 'f') {
+    case 'f':
         softuart_rx_flush();
         uart0_putsln_P(PSTR(""));
         uart0_putsln_P(PSTR("[receive queue flushed]"));
         uart0_putsln_P(PSTR(""));
         return;
-    }
 
-    if (c == 't') {
+    case 't':
         loopback_test();
         return;
-    }
 
-    /* Anything else is a cue to try the link again. */
-    run(PSTR("AT"), 2000);
+    default:
+        /* Anything else is a cue to try the link again. */
+        run(PSTR("AT"), 2000);
+        return;
+    }
 }
+
+/* ---------------------------------------------------------------------- */
+/* Diagnostics                                                             */
+/* ---------------------------------------------------------------------- */
 
 /*
  * Transmit a known string and decode it back through our own receiver.
