@@ -7,9 +7,9 @@ No Arduino core. No libraries. `avr-gcc` writes directly to registers.
 
 ## Status
 
-**Phase 3** — the bit-banged receiver works: `INT0` catches the start bit
-on D2 and `OCR1B` samples each bit at its midpoint, so the module's
-replies decode cleanly.
+**Phase 4** — the AT layer works: a non-blocking command/response state
+machine with timeouts. `AT` returns `OK`, and replies are parsed into
+lines rather than scanned as raw bytes.
 
 ## Hardware
 
@@ -35,5 +35,5 @@ Arduino ATmega16U2, so it enumerates as `/dev/ttyUSB0` instead of
 - [x] **Phase 1 — `uart0.c`.** Register-level USART0 debug console.
 - [x] **Phase 2 — `softuart_tx.c`.** Timer1-driven bit-banged transmit.
 - [x] **Phase 3 — `softuart_rx.c`.** `INT0` start-bit detect, sampling ISR.
-- [ ] **Phase 4 — `at.c` + `at_parse.c`.** Non-blocking AT command layer.
+- [x] **Phase 4 — `at.c` + `at_parse.c`.** Non-blocking AT command layer.
 - [ ] **Phase 5 — network.** Credentials in EEPROM, `AT+CWJAP`.
