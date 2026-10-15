@@ -1,0 +1,14 @@
+# Build output
+build/
+
+# Editor / language-server artifacts
+compile_commands.json
+.cache/
+
+# Toolchain artifacts, in case anything lands outside build/
+*.o
+*.d
+*.elf
+*.hex
+*.map
+*.lst
