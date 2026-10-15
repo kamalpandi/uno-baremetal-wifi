@@ -1,70 +1,76 @@
 /*
- * main.c — Phase 2: bit-banged transmit on D3 to the ESP8266.
+ * main.c — Phase 3: bit-banged receive on D2.
  *
- * Success looks like this:
+ * Now that we can both transmit and receive, we can ask the module a
+ * question and look at the answer. There is no line parser yet, so the
+ * reply is dumped as raw hex - which is the only honest way to look at a
+ * byte stream, because a terminal cannot show the difference between
+ * 0x00, 0xFF and a stray control character.
  *
- *   1. the debug console prints "tx #N: AT" a couple of times a second,
- *   2. the shield's RX LED flickers in time with it.
+ * Expected result:
  *
- * Point 2 is the real result. The LED sits on the ESP module's receive
- * line, so if it blinks then our hand-timed waveform physically reached
- * the shield. We still cannot read the ESP's reply - that is Phase 3 -
- * so we cannot yet confirm the module *understood* us, only that we are
- * putting a signal on the wire.
+ *   tx: AT   rx: 41 54 0D 0A 0D 0A 4F 4B 0D 0A
+ *
+ * which is the module's echo of "AT" followed by its "OK".
+ *
+ * Press the shield's ESP RESET button to watch the module boot: its log
+ * comes out at 74880 baud, roughly eight times faster than we listen, so
+ * it arrives as garbage. The stop-bit check discards most of it - the
+ * "rejected" count is that check doing its job, not a fault.
  */
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
-#include <util/delay.h>
 
 #include "softuart.h"
+#include "timer.h"
 #include "uart0.h"
 
 int main(void)
 {
-    uart0_init();
-    softuart_tx_init();
+    timer_init();
 
-    /*
-     * Global interrupt enable.
-     *
-     * The bit-banged transmitter runs entirely from TIMER1_COMPA_vect.
-     * Without sei() that ISR never fires, D3 just sits idle, and the
-     * program looks perfectly correct while doing nothing at all. If
-     * the LED ever stays dark, check this line first.
-     */
-    sei();
+    uart0_init();          /* debug console, D0/D1, 115200 */
+    softuart_tx_init();    /* sets up Timer1            */
+    softuart_rx_init();    /* needs Timer1 - call second */
+
+    sei();                 /* the soft UART lives on interrupts */
 
     uart0_putsln_P(PSTR(""));
     uart0_putsln_P(PSTR("uno-baremetal-wifi"));
-    uart0_putsln_P(PSTR("Phase 2: bit-banged TX on D3 @ 9600 8N1"));
+    uart0_putsln_P(PSTR("Phase 3: bit-banged RX on D2 @ 9600 8N1"));
     uart0_putsln_P(PSTR(""));
-    uart0_putsln_P(PSTR("Sending \"AT\" every 500 ms. The shield's RX LED"));
-    uart0_putsln_P(PSTR("should flicker. We cannot read the reply yet."));
+    uart0_putsln_P(PSTR("Sending AT every 2 s and dumping the reply as hex."));
     uart0_putsln_P(PSTR(""));
-
-    uint16_t n = 0;
 
     for (;;) {
-        n++;
+        uint16_t started;
 
-        uart0_puts_P(PSTR("tx #"));
-        uart0_put_udec(n);
-        uart0_putsln_P(PSTR(": AT"));
+        uart0_puts_P(PSTR("tx: AT   rx: "));
 
-        /* Queue "AT" plus the CR LF that every AT command needs. */
         softuart_tx_puts_P(PSTR("AT\r\n"));
 
-        /*
-         * Wait for those four bytes to actually leave the pin before
-         * spacing out the next command. softuart_tx_idle() is the hook
-         * Phase 4 will use to know when to start listening for a reply.
-         */
+        /* Wait for the four bytes to physically leave the pin. */
         while (!softuart_tx_idle()) {
         }
 
-        _delay_ms(500);
+        /* Collect and print the reply for two seconds. */
+        started = millis();
+        while (!timer_expired(started, 2000)) {
+            while (softuart_rx_has_data()) {
+                uart0_put_hex8(softuart_rx_getc());
+                uart0_putc(' ');
+            }
+        }
+
+        uart0_putsln_P(PSTR(""));
+        uart0_puts_P(PSTR("     frames ok "));
+        uart0_put_udec(softuart_rx_frames());
+        uart0_puts_P(PSTR(", rejected "));
+        uart0_put_udec(softuart_rx_errors());
+        uart0_putsln_P(PSTR(""));
+        uart0_putsln_P(PSTR(""));
     }
 
     return 0; /* unreachable */
