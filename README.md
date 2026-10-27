@@ -473,18 +473,28 @@ hoped for. Hardware is then used for the things a host cannot know: that
 the module really sends `+IPD` in this shape, and that it accepts our
 handshake.
 
-Then on real hardware: `AT+CIPSTART` to a **name** (so the module's own DNS
-was exercised), the `>` handshake, and a complete `HTTP/1.1 200 OK` response
-with `Connection: close` and no `Content-Length`. The summary read:
+Then on real hardware, three fetches, each with its byte counts:
 
-```
---- HTTP 200, body 577 bytes, response 892 bytes ---
-```
+| Target | Declared | Body counted | Response | Headers |
+|---|---|---|---|---|
+| `example.com:80` — DNS, HTTP/1.1, close-delimited | — | 577 | 892 | 315 |
+| LAN server, directory listing (HTTP/1.0) | `301` | 301 | 456 | 155 |
+| LAN server, `/at_parse.c` (HTTP/1.0) | `5479` | **5479** | 5668 | 189 |
 
-892 − 577 = 315 bytes of headers, and the body printed in full. That
-arithmetic is the real proof: the header block and the body account for
-exactly the bytes that arrived, which is only possible if the `+IPD` length
-was honoured precisely.
+Response − body is the header block, and the numbers only line up if every
+`+IPD` length was honoured exactly. The "declared" column is the server's own
+`Content-Length`, so the last two rows are independent confirmation from the
+other end of the wire.
+
+The last row is the one that matters. The body is this parser's own source,
+so it is full of `\r\n`, `:`, and the literal strings `"+IPD,"` and
+`+IPD,<len>:<bytes>`. A line-based reader would desynchronise at the first of
+those and then report a plausible but wrong count. Length framing carried all
+5479 bytes through, printed the first 1024 and counted the rest.
+
+At 9600 baud that response is about 5.9 seconds of wire time — inside the
+20-second budget, with the 4-second idle timer never firing because bytes
+kept arriving.
 
 ## Scope
 
