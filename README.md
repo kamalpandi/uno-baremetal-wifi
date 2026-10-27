@@ -99,6 +99,7 @@ make flash          # upload over the bootloader
 make flash monitor  # upload, then attach the console
 make monitor        # just attach the console
 make disasm         # disassembly interleaved with C source
+make test           # host-side tests for the +IPD framing and HTTP parser
 make compdb         # regenerate compile_commands.json for the editor (clangd)
 make clean
 ```
@@ -449,9 +450,14 @@ immediately, while length framing carries it through intact.
 
 ### How it was verified
 
-The framing and the HTTP state machine are pure logic, so they were compiled
-for the host with a stand-in `<avr/pgmspace.h>` and tested directly — 20
-assertions covering:
+The framing and the HTTP state machine are pure logic, so they compile for
+the host with a stand-in `<avr/pgmspace.h>`:
+
+```sh
+make test
+```
+
+Twenty assertions, covering:
 
 - a payload containing a literal `+IPD,`, and one containing `\r\nOK\r\n`
 - two consecutive blocks with no separator between them
@@ -462,8 +468,10 @@ assertions covering:
 - `\r\n\r\n` occurring **inside** the body
 
 That is cheaper and far more repeatable than flashing and reading a
-terminal. Hardware is then used for the things a host cannot know: that the
-module really sends `+IPD` in this shape, and that it accepts our handshake.
+terminal, and it lets awkward cases be asserted on purpose rather than
+hoped for. Hardware is then used for the things a host cannot know: that
+the module really sends `+IPD` in this shape, and that it accepts our
+handshake.
 
 Then on real hardware: `AT+CIPSTART` to a **name** (so the module's own DNS
 was exercised), the `>` handshake, and a complete `HTTP/1.1 200 OK` response

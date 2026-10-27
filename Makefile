@@ -54,7 +54,7 @@ AVRDUDE := avrdude
 # Targets
 # ===========================================================================
 
-.PHONY: all hex size flash monitor clean disasm check compdb
+.PHONY: all hex size flash monitor clean disasm check compdb test
 
 all: hex size
 
@@ -132,6 +132,25 @@ compdb: $(SRCS) | $(BUILD_DIR)
 	done
 	@printf ']\n' >> $(COMPDB)
 	@echo "wrote $(COMPDB)"
+
+# ===========================================================================
+# Host tests
+# ===========================================================================
+# at_parse.c and http.c are pure logic: no registers, no timers, no
+# interrupts. That means they compile for the PC, where awkward cases can be
+# asserted deliberately instead of flashed and watched on a terminal - a body
+# containing a literal "+IPD,", a zero-length block, a 404, a response with
+# no headers at all.
+#
+# tests/fake/avr/pgmspace.h stands in for the AVR header so PSTR(),
+# strcmp_P and pgm_read_byte collapse to their libc equivalents. Nothing
+# here touches the AVR toolchain, so `make` and `make flash` are unaffected.
+test:
+	@mkdir -p $(BUILD_DIR)
+	gcc -std=c11 -Wall -Wextra -Wshadow -I$(SRC_DIR) -Itests/fake \
+	    tests/test_parse.c $(SRC_DIR)/at_parse.c $(SRC_DIR)/http.c \
+	    -o $(BUILD_DIR)/test_parse
+	@$(BUILD_DIR)/test_parse
 
 # Pull in the auto-generated header dependencies (ignored on first build).
 -include $(DEPS)
