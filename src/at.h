@@ -17,6 +17,13 @@
  * The blocking while-loop above is the caller's choice, not a property
  * of the library. A program controlling motors would simply call
  * at_tick() once per loop pass and check at_ready() when convenient.
+ *
+ * Phase 6 adds two things that are not "send a line, wait for OK":
+ *
+ *   - AT+CIPSEND answers in two stages, first '>' and only then
+ *     "SEND OK", so the layer needs to be told what to expect (at_wait_t).
+ *   - received TCP data arrives as +IPD blocks and is handed to a sink
+ *     callback instead of being parsed as lines.
  */
 
 #ifndef AT_H
@@ -28,10 +35,27 @@
 typedef enum {
     AT_RESULT_NONE = 0,     /* no command has been run yet        */
     AT_RESULT_IN_PROGRESS,  /* queued or waiting for the response */
-    AT_RESULT_OK,           /* saw "OK"                           */
+    AT_RESULT_OK,           /* saw the answer we were waiting for */
     AT_RESULT_ERROR,        /* saw "ERROR" or "FAIL"              */
     AT_RESULT_TIMEOUT,      /* nothing definitive within the time */
 } at_result_t;
+
+/*
+ * What ends the command that is currently outstanding.
+ *
+ * AT_WAIT_FINAL is the ordinary case and the default. The other two
+ * exist because AT+CIPSEND replies "OK" *before* the '>' prompt: if that
+ * OK were allowed to finish the command, the payload would be sent to a
+ * module that is not yet listening for it.
+ */
+typedef enum {
+    AT_WAIT_FINAL = 0,      /* OK / ERROR / FAIL                   */
+    AT_WAIT_PROMPT,         /* '>' - payload may now be sent       */
+    AT_WAIT_SEND_OK,        /* "SEND OK" - payload was accepted    */
+} at_wait_t;
+
+/* Called once per received TCP payload byte (a +IPD block). */
+typedef void (*at_ipd_fn)(uint8_t c);
 
 void at_init(void);
 
@@ -42,6 +66,9 @@ void at_init(void);
  * `timeout_ms` is measured from the moment the last byte leaves the
  * wire, not from this call, so a slow baud rate cannot eat the budget.
  * Only valid when at_ready() is true.
+ *
+ * Resets the expectation to AT_WAIT_FINAL, so call at_set_wait() after
+ * this if the command is not an ordinary one.
  */
 void at_command(const char *cmd, uint16_t timeout_ms);
 void at_command_P(const char *cmd, uint16_t timeout_ms);
@@ -63,6 +90,37 @@ void at_command_P(const char *cmd, uint16_t timeout_ms);
  */
 void at_command_begin(uint16_t timeout_ms);
 void at_command_end(void);
+
+/* Choose what will end the outstanding command. See at_wait_t. */
+void at_set_wait(at_wait_t w);
+
+/*
+ * Queue raw bytes *without* a trailing newline and wait for "SEND OK".
+ *
+ * This is stage two of AT+CIPSEND, and it deliberately does not call
+ * at_command_begin(): that flushes the receiver and resets the parser,
+ * and by this point the module may already be pushing +IPD payload at
+ * us. Only the expectation and the clock change here.
+ *
+ * Blocks only if `len` exceeds the 128-byte transmit queue, which cannot
+ * happen for a request built by http_build_request().
+ */
+void at_send_data(const uint8_t *data, uint16_t len, uint16_t timeout_ms);
+
+/* Non-zero if the last completed command ended on the '>' prompt. */
+int at_prompt_seen(void);
+
+/*
+ * Non-zero once the module has reported "CLOSED". Sticky: it stays set
+ * until at_clear_closed(), because the peer can hang up at any moment,
+ * with no command outstanding at all. For an HTTP/1.0 request this is
+ * the end-of-response signal.
+ */
+int at_link_closed(void);
+void at_clear_closed(void);
+
+/* Register the handler for +IPD payload bytes. Pass 0 to discard them. */
+void at_set_ipd_sink(at_ipd_fn fn);
 
 /*
  * The numeric code from the most recent "+CMD:<n>" response line, or -1
@@ -88,6 +146,10 @@ at_result_t at_result(void);
  * Mirror received bytes to the debug console as they arrive. On by
  * default, because watching the raw module output is how you find out
  * what it is really doing.
+ *
+ * Payload bytes are never mirrored regardless of this setting: they go
+ * to the +IPD sink, which decides for itself what to show. That is what
+ * keeps a multi-kilobyte HTTP body from burying the console.
  */
 void at_set_echo(int on);
 

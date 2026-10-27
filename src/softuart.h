@@ -51,6 +51,12 @@ void softuart_tx_puts(const char *s);
 void softuart_tx_puts_P(const char *s);
 
 /*
+ * Queue an unsigned 16-bit value in decimal. Used to build commands whose
+ * arguments are numbers: AT+CIPSEND=<len> and the port in AT+CIPSTART.
+ */
+void softuart_tx_put_udec(uint16_t value);
+
+/*
  * Non-zero when every queued byte has physically left the pin. Used to
  * know when a command has finished going out before we start listening
  * for a reply.

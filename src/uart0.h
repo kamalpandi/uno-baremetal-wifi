@@ -50,6 +50,16 @@ void uart0_put_hex8(uint8_t value);
 void uart0_put_udec(uint16_t value);
 
 /*
+ * Send an unsigned 32-bit value in decimal.
+ *
+ * Only needed because an HTTP response size is not bounded by anything
+ * we control: a directory listing fits in 16 bits, a file need not. It
+ * costs a software 32-bit divide, which is why the 16-bit version still
+ * exists for everything else.
+ */
+void uart0_put_udec32(uint32_t value);
+
+/*
  * Non-blocking receive.
  *
  * uart0_has_data() returns non-zero if a byte is waiting. uart0_getc()

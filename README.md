@@ -7,6 +7,48 @@ No Arduino core. No libraries. `avr-gcc` writes directly to registers, and the
 ESP8266 is spoken to with raw Hayes AT commands over a serial line we time by
 hand.
 
+## What it does
+
+Joins a WiFi network using credentials typed at the serial console and kept in
+the chip's own EEPROM, then fetches a page over TCP and prints it:
+
+```
+> AT+CIPSTART="TCP","192.168.29.91",8000
+  [OK]
+> AT+CIPSEND=44
+  prompt received, sending 44 bytes
+  SEND OK
+
+--- response ---
+HTTP/1.0 200 OK
+Server: SimpleHTTP/0.6 Python/3.11
+Content-Type: text/html; charset=utf-8
+Content-Length: 1420
+...
+--- HTTP 200, body 1420 bytes, response 1596 bytes ---
+```
+
+That is **9534 bytes of flash and 784 bytes of RAM** — no libraries, no
+allocator, no buffering of the response.
+
+### Console keys
+
+Type into `picocom`; it has no local echo, so the firmware echoes for you.
+
+| Key | Action |
+|---|---|
+| `c` | enter WiFi credentials and save them to EEPROM |
+| `u` | show the stored credentials |
+| `j` | join the network |
+| `n` | network status (mode and IP address) |
+| `g` | fetch a page over TCP — then host, port, path |
+| `i` | re-run module init (`ATE0`, single-connection mode) |
+| `h` | toggle hex dump of received bytes |
+| `s` | receiver counters |
+| `f` | flush the receive queue |
+| `t` | loopback self-test (D2 jumpered to D3) |
+| any other | send `AT` |
+
 ---
 
 ## Why there are two serial ports
@@ -140,7 +182,8 @@ AVR-aware completion and diagnostics. Both generated files
 | `at.c` | The non-blocking AT command state machine |
 | `eeprom.c` | Register-level access to the 1024-byte on-chip EEPROM |
 | `settings.c` | Credential layout, validity marker, load/save |
-| `net.c` | The join sequence: `CWMODE` → `CWJAP` → `CIPSTA` |
+| `net.c` | The join sequence, then one TCP connection: `CIPSTART` / `CIPSEND` / `CIPCLOSE` |
+| `http.c` | Builds one `GET`, parses the status line and headers, streams the body |
 
 ## How the soft UART works
 
@@ -214,20 +257,27 @@ diagnostic build) that cannot be fooled by a moving pin.
 
 ## RAM budget
 
-Measured on the Phase 5 build — 580 of 2048 bytes, or 28%:
+Measured on the final build — 784 of 2048 bytes, or 38%:
 
 | Region | Bytes |
 |---|---|
 | `rx_buf` (soft UART receive queue) | 256 |
 | `tx_buf` (soft UART transmit queue) | 128 |
+| HTTP request buffer | 112 |
 | WiFi credentials (SSID + password) | 97 |
 | AT line accumulator | 64 |
-| all state variables, timers, counters | 35 |
+| host and path typed at the console | 64 |
+| all state variables, timers, counters | 63 |
 
-The remaining ~1.4 KB is stack. Note that the receive queue alone is an
-eighth of the chip, which is what forces the AT parser to be
-line-bounded and (from Phase 6) forces HTTP bodies to be stream-parsed
-rather than buffered.
+The remaining ~1.2 KB is stack. The receive queue alone is an eighth of the
+chip, and that single number is what decides the whole design of Phase 6: an
+HTTP response **cannot** be buffered, so it is parsed and printed as it
+arrives.
+
+Note what the HTTP request buffer is *not* for. It is not a response buffer —
+it holds the ~90-byte request we are about to send. It exists because
+`AT+CIPSEND=<n>` demands the byte count **before** any byte goes out, so there
+is no way to stream a request whose length is not yet known.
 
 ## EEPROM credentials
 
@@ -255,6 +305,188 @@ source tree. They are, however, stored and transmitted in plaintext.
 
 ---
 
+## Phase 6: a TCP connection and an HTTP response
+
+Everything up to Phase 5 was request/response: send a line, wait for a line.
+A TCP connection is not, and it breaks three assumptions at once.
+
+### 1. Received data is not line-shaped
+
+When the module receives TCP data it pushes it as:
+
+```
++IPD,<len>:<exactly len raw bytes>
+```
+
+There is no terminator. **The length is the only boundary** — and that is a
+much sharper edge than it looks. Get it wrong by one and nothing fails
+loudly: the stream shifts by a byte, the HTML still looks roughly like HTML,
+and every subsequent block is misread.
+
+So `at_parse.c` has two modes. Up to `+IPD,<len>:` it accumulates lines
+exactly as before. The instant the colon closes that header it switches to
+data mode, counts payload bytes, and hands each one straight to a sink
+callback. Nothing is stored, so a response of any size passes through in
+constant memory.
+
+Because the parser is fed one byte at a time, a header split across two
+ring-buffer reads is harmless. A block-based parser would need real care
+there.
+
+### 2. `AT+CIPSEND` is a two-stage handshake
+
+```
+AT+CIPSEND=44
+OK            <- the module accepted the command
+>             <- now it is listening for exactly 44 bytes
+<44 bytes>
+SEND OK       <- the payload was taken
+```
+
+The `OK` is **not** the answer. If the state machine treated it as the
+result it would start pushing the payload into a module that had not yet
+opened its input, and lose the first bytes.
+
+That is why `at.c` grew `at_wait_t`: the layer is told what a *successful*
+ending looks like (`OK`, the `>` prompt, or `SEND OK`) instead of assuming it
+is always `OK`.
+
+The `>` is also the only thing the module sends **without a newline**, so
+line accumulation can never complete on it — it would sit in the buffer until
+the AT command timed out. It is special-cased to emit a line immediately.
+Some firmware versions send it as `> ` with a trailing space, which would
+glue itself onto the front of the next line and stop `SEND OK` from matching,
+so a space at the start of a line is swallowed.
+
+### 3. There is no end-of-body marker except the connection closing
+
+HTTP/1.0 makes this trivial: the server closes when it is finished, so
+`CLOSED` *is* the end of the response. No `Content-Length` parsing, no header
+line buffer.
+
+That one choice removes the last thing that would have needed RAM. The status
+code is read by **position** instead — it lives at columns 9-11:
+
+```
+H T T P / 1 . 0   2 0 0   O K
+0 1 2 3 4 5 6 7 8 9 ...
+```
+
+and end-of-headers is a single byte of state: "has anything non-CRLF appeared
+since the last newline?". When a newline arrives and the answer is no, the
+blank line has been found.
+
+The request is deliberately minimal, because with HTTP/1.0 `Connection:
+close` is already the default:
+
+```
+GET /path HTTP/1.0\r\n
+Host: 192.168.29.91\r\n
+\r\n
+```
+
+### Printing without flooding
+
+The body is printed as it is parsed, within a **1024-byte budget** shared by
+headers and body. Bytes past the budget are still counted, just not shown:
+
+```
+--- HTTP 200, body 4210 bytes, response 4386 bytes ---
+--- printed the first 1024 bytes only ---
+```
+
+A large response therefore reports its true size while the console stays
+readable. The budget costs two bytes of state, not 1024 — it is a stopping
+point for printing, not a buffer. Press `q` during a transfer to abandon it.
+
+### Trying it
+
+Serve something from your laptop:
+
+```sh
+mkdir -p /tmp/www && cd /tmp/www
+python3 -m http.server 8000 --bind 0.0.0.0
+hostname -I          # the address to type at the Uno's prompt
+```
+
+Then on the Uno: `j` to join, then `g`:
+
+```
+Server IP or name: 192.168.29.91
+Port [8000]:
+Path [/]:
+```
+
+Python's handler speaks HTTP/1.0 by default, which is exactly the case this
+parser is built for.
+
+If the fetch reports `connection failed`, the server is fine but something
+between the two is not. On a Linux desktop the usual culprit is `ufw`:
+
+```sh
+sudo ufw allow 8000/tcp     # or scope it to your LAN
+```
+
+Worth knowing how to tell the failure modes apart, because `AT+CIPSTART`
+answers `ERROR` for all of them, including "the packet was silently dropped".
+Two clues:
+
+- **When** the ERROR arrives. Our 10-second budget expires first and prints
+  the failure, then the module's `ERROR` turns up afterwards. That is a
+  dropped packet — firewall or wrong address. A command the module actually
+  rejects comes back immediately instead.
+- **Whether the server logs a connection at all.** If the listener saw
+  nothing, the SYN never arrived, so nothing about the request can be wrong.
+
+A public HTTP server is a useful control experiment, because no local
+firewall can break it: if `example.com:80` works and a LAN address does not,
+the firmware is fine and the network is the problem.
+
+A better test than a directory listing: copy `at_parse.c` into the served
+directory and fetch `/at_parse.c`. The body is then full of `\r\n`, `:`, and
+the literal string `+IPD,` — a line-based parser would corrupt it
+immediately, while length framing carries it through intact.
+
+### How it was verified
+
+The framing and the HTTP state machine are pure logic, so they were compiled
+for the host with a stand-in `<avr/pgmspace.h>` and tested directly — 20
+assertions covering:
+
+- a payload containing a literal `+IPD,`, and one containing `\r\nOK\r\n`
+- two consecutive blocks with no separator between them
+- a zero-length `+IPD,0:` block
+- data mode ending exactly after `len` bytes
+- the `>` prompt, including the `> ` trailing-space form
+- 200 and 404 status lines, and a response with no headers at all
+- `\r\n\r\n` occurring **inside** the body
+
+That is cheaper and far more repeatable than flashing and reading a
+terminal. Hardware is then used for the things a host cannot know: that the
+module really sends `+IPD` in this shape, and that it accepts our handshake.
+
+Then on real hardware: `AT+CIPSTART` to a **name** (so the module's own DNS
+was exercised), the `>` handshake, and a complete `HTTP/1.1 200 OK` response
+with `Connection: close` and no `Content-Length`. The summary read:
+
+```
+--- HTTP 200, body 577 bytes, response 892 bytes ---
+```
+
+892 − 577 = 315 bytes of headers, and the body printed in full. That
+arithmetic is the real proof: the header block and the body account for
+exactly the bytes that arrived, which is only possible if the `+IPD` length
+was honoured precisely.
+
+## Scope
+
+Phase 6 is the end of this project. What it deliberately does **not** do:
+chunked transfer encoding, keep-alive, redirects, gzip, TLS, or
+`AT+CIPRECVMODE` passive receive (the module's firmware, AT 1.7.4.0, predates
+it). One request, one response, one connection, closed at the end.
+
+---
+
 ## Roadmap
 
 - [x] **Phase 0 — toolchain.** Blink PB5, prove `avrdude` works on this clone.
@@ -263,4 +495,12 @@ source tree. They are, however, stored and transmitted in plaintext.
 - [x] **Phase 3 — `softuart_rx.c`.** `INT0` start-bit detect, `OCR1B` mid-bit sampling, ring buffer.
 - [x] **Phase 4 — `at.c` + `at_parse.c`.** Non-blocking command/response state machine with timeouts.
 - [x] **Phase 5 — network.** Credentials in EEPROM, entered over the console; `AT+CWMODE=1` + `AT+CWJAP`.
-- [ ] **Phase 6 — TCP.** `AT+CIPSTART` / `AT+CIPSEND`, stream parsing.
+- [x] **Phase 6 — TCP.** `AT+CIPSTART` / `AT+CIPSEND`, `+IPD` framing, streamed HTTP GET.
+
+Each phase is a tagged commit, and every one of them builds and runs:
+
+```sh
+git checkout phase-3      # or phase-0 … phase-6
+make size
+git checkout main
+```

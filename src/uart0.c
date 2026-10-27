@@ -196,6 +196,36 @@ void uart0_put_udec(uint16_t value)
     }
 }
 
+void uart0_put_udec32(uint32_t value)
+{
+    /*
+     * Same trick as uart0_put_udec(), with a wider buffer. 4294967295
+     * is ten digits, so 10 bytes is exactly enough.
+     *
+     * The AVR has no divide instruction at 32 bits either, so this pulls
+     * in avr-libc's long division. Worth it here: a 16-bit counter would
+     * silently wrap at 64 KB and report a large response as a small one.
+     */
+    char    buf[10];
+    uint8_t i = 0;
+
+    if (value == 0) {
+        uart0_putc('0');
+        return;
+    }
+
+    while (value > 0) {
+        buf[i] = (char)('0' + (value % 10));
+        i++;
+        value /= 10;
+    }
+
+    while (i > 0) {
+        i--;
+        uart0_putc(buf[i]);
+    }
+}
+
 int uart0_has_data(void)
 {
     /* RXC0 is set by the hardware when an unread byte sits in UDR0. */

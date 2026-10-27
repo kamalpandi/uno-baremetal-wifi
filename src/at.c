@@ -5,7 +5,7 @@
  *
  *   IDLE     nothing outstanding
  *   SENDING  bytes queued, still going out at 9600
- *   WAITING  on the wire; listening for a final response code
+ *   WAITING  on the wire; listening for the answer we asked for
  *
  * The SENDING state exists for a reason that is easy to miss. At 9600
  * baud a short command takes a few milliseconds to leave the pin, and
@@ -14,6 +14,11 @@
  * charge the command's own transmission time against its budget, which
  * matters for slow links and long commands. Instead the clock starts
  * once softuart_tx_idle() says the line is quiet.
+ *
+ * What counts as *the* answer is not always "OK". See at_wait_t in at.h:
+ * AT+CIPSEND answers "OK" and then ">", and the payload stage answers
+ * "SEND OK". The expectation is a separate field so one state machine
+ * can serve all three shapes.
  */
 
 #include <string.h>
@@ -40,16 +45,25 @@ static uint8_t     hexdump;
 static uint16_t    rx_bytes;  /* total bytes seen from the module */
 static int16_t     last_code; /* from a "+CMD:<n>" line, or -1 */
 
+static at_wait_t   wait_for;    /* what ends the outstanding command */
+static uint8_t     prompt_seen; /* the '>' stage completed           */
+static uint8_t     link_closed; /* sticky, "CLOSED" was reported     */
+static at_ipd_fn   ipd_sink;    /* where +IPD payload goes           */
+
 void at_init(void)
 {
     at_parse_reset();
 
-    state     = AT_ST_IDLE;
-    result    = AT_RESULT_NONE;
-    echo      = 1;
-    hexdump   = 0;
-    rx_bytes  = 0;
-    last_code = -1;
+    state       = AT_ST_IDLE;
+    result      = AT_RESULT_NONE;
+    echo        = 1;
+    hexdump     = 0;
+    rx_bytes    = 0;
+    last_code   = -1;
+    wait_for    = AT_WAIT_FINAL;
+    prompt_seen = 0;
+    link_closed = 0;
+    ipd_sink    = 0;
 }
 
 int at_ready(void)
@@ -82,6 +96,31 @@ int16_t at_last_code(void)
     return last_code;
 }
 
+void at_set_wait(at_wait_t w)
+{
+    wait_for = w;
+}
+
+int at_prompt_seen(void)
+{
+    return prompt_seen != 0;
+}
+
+int at_link_closed(void)
+{
+    return link_closed != 0;
+}
+
+void at_clear_closed(void)
+{
+    link_closed = 0;
+}
+
+void at_set_ipd_sink(at_ipd_fn fn)
+{
+    ipd_sink = fn;
+}
+
 void at_command_begin(uint16_t timeout_ms)
 {
     /*
@@ -93,10 +132,12 @@ void at_command_begin(uint16_t timeout_ms)
     softuart_rx_flush();
     at_parse_reset();
 
-    last_code = -1;
-    result    = AT_RESULT_IN_PROGRESS;
-    timeout   = timeout_ms;
-    state     = AT_ST_SENDING;
+    last_code   = -1;
+    result      = AT_RESULT_IN_PROGRESS;
+    timeout     = timeout_ms;
+    wait_for    = AT_WAIT_FINAL;
+    prompt_seen = 0;
+    state       = AT_ST_SENDING;
 }
 
 void at_command_end(void)
@@ -118,6 +159,27 @@ void at_command_P(const char *cmd, uint16_t timeout_ms)
     at_command_begin(timeout_ms);
     softuart_tx_puts_P(cmd);
     at_command_end();
+}
+
+void at_send_data(const uint8_t *data, uint16_t len, uint16_t timeout_ms)
+{
+    uint16_t i;
+
+    for (i = 0; i < len; i++) {
+        softuart_tx_putc((char)data[i]);
+    }
+
+    /*
+     * Note what is *not* done here: no softuart_rx_flush(), no
+     * at_parse_reset(). At this moment the module may already be
+     * streaming +IPD payload at us, and throwing away the receive queue
+     * would lose the start of the response.
+     */
+    result      = AT_RESULT_IN_PROGRESS;
+    timeout     = timeout_ms;
+    wait_for    = AT_WAIT_SEND_OK;
+    prompt_seen = 0;
+    state       = AT_ST_SENDING;
 }
 
 /* Read a decimal number at the start of s, skipping leading spaces. */
@@ -153,25 +215,69 @@ static void at_handle_line(const char *line)
         last_code = parse_code(line + 7);
     }
 
+    /*
+     * CLOSED is asynchronous: the peer can hang up with no command in
+     * flight at all, and it is the only end-of-response signal an
+     * HTTP/1.0 fetch gets. Record it before anything below can return.
+     */
+    if (r == AT_RESP_CLOSED) {
+        link_closed = 1;
+    }
+
     if (state == AT_ST_IDLE) {
         /*
          * Unsolicited message with no command outstanding - "WIFI
-         * DISCONNECT", for instance. It has already been echoed to the
-         * console, which is all we can usefully do with it for now.
+         * DISCONNECT" or "CLOSED", for instance. It has already been
+         * echoed to the console, which is all we can usefully do with
+         * it here.
          */
         return;
     }
 
     /*
-     * Until a final code arrives, everything else is noise we simply
-     * ignore: the echo of our own command, "+CWMODE:1" style
-     * information, "(3,6)" boot text, blank lines.
+     * '>' is an intermediate answer. It finishes the CIPSEND stage only
+     * when that is what we asked for; at any other time it is noise.
      */
+    if (r == AT_RESP_SEND_PROMPT) {
+        if (wait_for == AT_WAIT_PROMPT && state == AT_ST_WAITING) {
+            prompt_seen = 1;
+            result      = AT_RESULT_OK;
+            state       = AT_ST_IDLE;
+        }
+        return;
+    }
+
+    /* "SEND OK" is the final code of the payload stage. */
+    if (r == AT_RESP_SEND_OK) {
+        if (wait_for == AT_WAIT_SEND_OK) {
+            result = AT_RESULT_OK;
+            state  = AT_ST_IDLE;
+        }
+        return;
+    }
+
+    /*
+     * ERROR and FAIL are never valid intermediate answers, so they end
+     * the command whatever we happened to be waiting for. Without this
+     * a rejected payload would sit until its timeout expired.
+     */
+    if (r == AT_RESP_ERROR || r == AT_RESP_FAIL) {
+        result = AT_RESULT_ERROR;
+        state  = AT_ST_IDLE;
+        return;
+    }
+
+    /*
+     * Everything else is only final if a final code is what we expect.
+     * AT+CIPSEND answers "OK" and then ">"; treating that OK as the
+     * result would send the payload too early.
+     */
+    if (wait_for != AT_WAIT_FINAL) {
+        return;
+    }
+
     if (r == AT_RESP_OK) {
         result = AT_RESULT_OK;
-        state  = AT_ST_IDLE;
-    } else if (r == AT_RESP_ERROR || r == AT_RESP_FAIL) {
-        result = AT_RESULT_ERROR;
         state  = AT_ST_IDLE;
     }
 }
@@ -187,9 +293,24 @@ void at_tick(void)
      * back) would otherwise overwrite lines before they were read.
      */
     while (softuart_rx_has_data()) {
-        uint8_t c = softuart_rx_getc();
+        uint8_t        c = softuart_rx_getc();
+        at_parse_evt_t evt;
 
         rx_bytes++;
+
+        evt = at_parse_byte(c);
+
+        if (evt == AT_PARSE_DATA) {
+            /*
+             * Payload. Handed straight to the sink, never mirrored: a
+             * few kilobytes of HTML would bury the console, and the
+             * sink is better placed to decide what is worth printing.
+             */
+            if (ipd_sink != 0) {
+                ipd_sink(c);
+            }
+            continue;
+        }
 
         if (hexdump) {
             /* Two hex digits and a space per byte: lossless. */
@@ -199,7 +320,7 @@ void at_tick(void)
             uart0_putc((char)c);
         }
 
-        if (at_parse_byte(c)) {
+        if (evt == AT_PARSE_LINE) {
             at_handle_line(at_parse_line());
             at_parse_consume();
         }

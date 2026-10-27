@@ -1,16 +1,23 @@
 /*
- * main.c — Phase 5: credentials in EEPROM, and joining a network.
+ * main.c — Phase 6: an HTTP GET over a real TCP connection.
  *
  * CONTROLS (type into picocom; it has no local echo)
- *   any other key  send AT
  *   c              enter WiFi credentials and save them to EEPROM
  *   u              show the stored credentials
  *   j              join the network
  *   n              network status (mode and IP address)
+ *   g              fetch a page from a LAN server (TCP + HTTP)
+ *   i              re-run module init (ATE0, single-connection mode)
  *   h              toggle hex dump of received bytes
  *   s              receiver counters
  *   f              flush the receive queue
  *   t              loopback self-test (needs D2 jumpered to D3)
+ *   any other key  send AT
+ *
+ * The fetch is the point of the phase. It is blocking and watchable on
+ * purpose: the AT handshake prints as it goes, then the response body
+ * scrolls past until either the server closes the connection or the
+ * budget of 1024 bytes runs out. Press 'q' to abandon a slow transfer.
  */
 
 #include <string.h>
@@ -20,6 +27,7 @@
 
 #include "at.h"
 #include "console.h"
+#include "http.h"
 #include "net.h"
 #include "settings.h"
 #include "softuart.h"
@@ -30,6 +38,7 @@ static uint8_t hex_mode;
 
 static void set_credentials(void);
 static void show_credentials(void);
+static void fetch_demo(void);
 static void report_stats(void);
 static void loopback_test(void);
 static void run(const char *cmd_p, uint16_t timeout_ms);
@@ -43,16 +52,18 @@ int main(void)
     softuart_tx_init();    /* sets up Timer1            */
     softuart_rx_init();    /* needs Timer1 - call second */
     at_init();
+    http_init();           /* registers the +IPD sink   */
 
     sei();                 /* the soft UART lives on interrupts */
 
     uart0_putsln_P(PSTR(""));
     uart0_putsln_P(PSTR("uno-baremetal-wifi"));
-    uart0_putsln_P(PSTR("Phase 5: EEPROM credentials + network join"));
+    uart0_putsln_P(PSTR("Phase 6: HTTP GET over TCP"));
     uart0_putsln_P(PSTR(""));
     uart0_putsln_P(PSTR("  c  set WiFi credentials       j  join network"));
     uart0_putsln_P(PSTR("  u  show stored credentials    n  network status"));
-    uart0_putsln_P(PSTR("  h  hex dump      s  counters   f  flush   t  loopback"));
+    uart0_putsln_P(PSTR("  g  fetch a page (HTTP)        i  re-init module"));
+    uart0_putsln_P(PSTR("  h  hex dump   s  counters   f  flush   t  loopback"));
     uart0_putsln_P(PSTR("  any other key  send AT"));
     uart0_putsln_P(PSTR(""));
 
@@ -63,7 +74,14 @@ int main(void)
     } else {
         uart0_putsln_P(PSTR("No WiFi credentials stored yet - press 'c'."));
     }
-    uart0_putsln_P(PSTR(""));
+
+    /*
+     * Silence the module's command echo before anything else. It is not
+     * required - everything still works with echo on - but from here on
+     * the console shows one copy of each command instead of two, and a
+     * CWJAP line never contains the password.
+     */
+    net_init();
 
     for (;;) {
         at_tick();
@@ -141,6 +159,169 @@ static void show_credentials(void)
 }
 
 /* ---------------------------------------------------------------------- */
+/* The fetch                                                               */
+/* ---------------------------------------------------------------------- */
+
+/* Parse a decimal field. Returns 0 for an empty or non-numeric string. */
+static uint16_t parse_dec(const char *s)
+{
+    uint16_t value = 0;
+
+    while (*s >= '0' && *s <= '9') {
+        value = (uint16_t)((value * 10) + (*s - '0'));
+        s++;
+    }
+
+    return value;
+}
+
+static void fetch_demo(void)
+{
+    /*
+     * All three live in .bss rather than on the stack: the request buffer
+     * is 112 bytes and the stack on this part is only a couple of hundred
+     * deep at the best of times.
+     */
+    static char host[32];
+    static char path[32];
+    static char request[HTTP_REQ_MAX];
+
+    char     port_text[6];
+    uint16_t port = 8000;
+    uint16_t len;
+    uint16_t started;
+    uint16_t quiet_at;
+    uint16_t seen;
+    uint8_t  finished;
+
+    uart0_putsln_P(PSTR(""));
+    uart0_putsln_P(PSTR("=== fetch a page over TCP ==="));
+    uart0_putsln_P(PSTR("(server example: python3 -m http.server 8000)"));
+    uart0_putsln_P(PSTR(""));
+
+    uart0_puts_P(PSTR("Server IP or name: "));
+    if (console_read_line(host, (uint8_t)(sizeof host - 1)) == 0) {
+        uart0_putsln_P(PSTR("cancelled."));
+        uart0_putsln_P(PSTR(""));
+        return;
+    }
+
+    uart0_puts_P(PSTR("Port [8000]: "));
+    if (console_read_line(port_text, (uint8_t)(sizeof port_text - 1)) > 0) {
+        port = parse_dec(port_text);
+        if (port == 0) {
+            port = 8000;
+        }
+    }
+
+    uart0_puts_P(PSTR("Path [/]: "));
+    if (console_read_line(path, (uint8_t)(sizeof path - 1)) == 0) {
+        path[0] = '/';
+        path[1] = '\0';
+    }
+
+    /*
+     * The request has to exist in memory before it is sent: AT+CIPSEND
+     * demands the byte count up front, so there is no way to stream a
+     * request whose length is not yet known.
+     */
+    len = http_build_request(request, (uint16_t)sizeof request, host, path);
+
+    uart0_putsln_P(PSTR(""));
+    uart0_puts_P(PSTR("=== GET "));
+    uart0_puts(path);
+    uart0_puts_P(PSTR(" from "));
+    uart0_puts(host);
+    uart0_puts_P(PSTR(":"));
+    uart0_put_udec(port);
+    uart0_putsln_P(PSTR(" ==="));
+
+    /*
+     * Turn the byte mirror off for the duration. The +IPD payload is
+     * printed by the HTTP layer within its budget, so mirroring it as
+     * well would show every byte twice and let a large body bury the
+     * console. Press 'h' before a fetch to see the raw framing instead.
+     */
+    at_set_echo(0);
+    http_begin();
+
+    if (!net_tcp_open(host, port)) {
+        at_set_echo(1);
+        return;
+    }
+
+    if (!net_tcp_send((const uint8_t *)request, len)) {
+        net_tcp_close();
+        at_set_echo(1);
+        return;
+    }
+
+    uart0_putsln_P(PSTR(""));
+    uart0_putsln_P(PSTR("--- response ---"));
+
+    /*
+     * Drain until the peer hangs up. Two clocks run at once: a total
+     * budget so a chatty server cannot hold us forever, and a shorter
+     * idle budget so a silently stalled connection is noticed rather
+     * than waited out. Both stay below 32.7 s, the range in which
+     * timer_expired() is wrap-safe.
+     */
+    started  = millis();
+    quiet_at = started;
+    seen     = at_rx_bytes();
+
+    while (!http_done()) {
+        at_tick();
+
+        if (at_rx_bytes() != seen) {
+            seen     = at_rx_bytes();
+            quiet_at = millis();
+        }
+
+        if (timer_expired(quiet_at, 4000)) {
+            break;
+        }
+
+        if (timer_expired(started, 20000)) {
+            break;
+        }
+
+        /* 'q' abandons a transfer without needing a reset. */
+        if (uart0_has_data()) {
+            if (uart0_getc() == 'q') {
+                break;
+            }
+        }
+    }
+
+    finished = (uint8_t)http_done();
+
+    net_tcp_close();
+    at_set_echo(1);
+
+    uart0_putsln_P(PSTR(""));
+    uart0_puts_P(PSTR("--- HTTP "));
+    uart0_put_udec(http_status());
+    uart0_puts_P(PSTR(", body "));
+    uart0_put_udec32(http_body_bytes());
+    uart0_puts_P(PSTR(" bytes, response "));
+    uart0_put_udec32(http_total_bytes());
+    uart0_putsln_P(PSTR(" bytes ---"));
+
+    if (http_total_bytes() > HTTP_PRINT_MAX) {
+        uart0_puts_P(PSTR("--- printed the first "));
+        uart0_put_udec((uint16_t)HTTP_PRINT_MAX);
+        uart0_putsln_P(PSTR(" bytes only ---"));
+    }
+
+    if (!finished) {
+        uart0_putsln_P(PSTR("--- connection did not close: transfer stopped early ---"));
+    }
+
+    uart0_putsln_P(PSTR(""));
+}
+
+/* ---------------------------------------------------------------------- */
 /* Key handling                                                            */
 /* ---------------------------------------------------------------------- */
 
@@ -161,6 +342,14 @@ static void handle_key(char c)
 
     case 'n':
         net_status();
+        return;
+
+    case 'g':
+        fetch_demo();
+        return;
+
+    case 'i':
+        net_init();
         return;
 
     case 'h':

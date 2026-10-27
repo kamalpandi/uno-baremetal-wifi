@@ -187,6 +187,28 @@ void softuart_tx_puts_P(const char *s)
     }
 }
 
+void softuart_tx_put_udec(uint16_t value)
+{
+    /*
+     * Digits come out least-significant first, so collect them and
+     * queue them backwards. 65535 is the widest a uint16_t can be, so
+     * five bytes is enough.
+     */
+    char    buf[5];
+    uint8_t n = 0;
+
+    do {
+        buf[n] = (char)('0' + (value % 10));
+        n++;
+        value = (uint16_t)(value / 10);
+    } while (value > 0);
+
+    while (n > 0) {
+        n--;
+        softuart_tx_putc(buf[n]);
+    }
+}
+
 int softuart_tx_idle(void)
 {
     return (!tx_busy && (tx_head == tx_tail)) ? 1 : 0;
